@@ -90,22 +90,39 @@ make reset        # Stop containers AND delete all volumes (--remove-orphans cle
 
 | Service | Depends On | Why |
 |---|---|---|
-| | | |
-| | | |
-| | | |
+| `api` | `database` ⚠️ `condition: service_healthy` | Django runs database migrations and opens a connection pool at startup. If Postgres isn't fully ready yet, those calls fail and the container crashes. The healthcheck (`pg_isready`) gates the API until Postgres is actually accepting connections — not just started. |
+| `prometheus` | `api` (plain `depends_on`) | Prometheus's job is to scrape the `/metrics/metrics` endpoint on the API. If the API container hasn't started yet, the first scrape would fail. A plain `depends_on` only waits for the container to *start*, not to be healthy, so there may still be a brief window where the first scrape is missed. |
+| `grafana` | `prometheus` (plain `depends_on`) | Grafana reads its data from Prometheus. If Prometheus isn't running, Grafana has no data source to connect to and dashboards will be empty. Again, plain `depends_on` means Docker waits for the Prometheus container to start, not for it to finish loading its config. |
+| `postgres_exporter` | `database` (plain `depends_on`) | The exporter connects to Postgres to read internal stats (pg_stat_* tables) and re-expose them as Prometheus metrics. It can't collect anything if the database isn't up. Unlike the API, a failed connection here doesn't crash the system — it just produces no metrics until Postgres is ready. |
+
+> **`condition: service_healthy` vs plain `depends_on`:** A plain `depends_on` only waits for Docker to report the container as *running* — the process inside may still be initialising. `condition: service_healthy` goes further: Docker repeatedly runs the healthcheck command (`pg_isready` for the database) and only releases the dependent service once it passes. The API uses this stricter condition because a crashed Django startup is hard to recover from; the monitoring services use plain `depends_on` because a missed metric or a brief connection error is tolerable.
 
 ### 1e. Main Entry Points
 
 | Service | Startup File | Routes / URL Config File |
 |---|---|---|
-| | | |
-| | | |
-| | | |
+| `api` (Django) | [learn-ops-api/entrypoint.sh](../learn-ops-api/entrypoint.sh) — checks Postgres is ready, runs migrations, creates fixtures/superuser, then hands off to `manage.py runserver` | [learn-ops-api/LearningPlatform/urls.py](../learn-ops-api/LearningPlatform/urls.py) — root URL config; registers all DRF router routes and includes sub-configs for auth, logs, admin, and Prometheus metrics |
+| `client` (React) | [learn-ops-client/src/index.js](../learn-ops-client/src/index.js) — React entry point; wraps the app in `BrowserRouter` and mounts it to `#root` (launched via `npm start` → `react-scripts start`) | [learn-ops-client/src/components/LearnOps.js](../learn-ops-client/src/components/LearnOps.js) — top-level router; redirects unauthenticated users to `/login` and delegates to `ApplicationViews`, `StudentViews`, or `StaffViews` based on the logged-in user's role |
+| `database` | Built into official `postgres:16` image | N/A |
+| `prometheus` | Built into official `prom/prometheus` image | N/A |
+| `grafana` | Built into official `grafana/grafana` image | N/A |
+| `postgres_exporter` | Built into official `quay.io/prometheuscommunity/postgres-exporter` image | N/A |
 
 ## 2. Services
 
 | Service Name | Tech Stack (including version) | Purpose |
 |---|---|---|
-| | | |
+| `database` | PostgreSQL 16 | Stores all persistent application data — user accounts, cohort enrollments, course content, assessment records, and student progress |
+| `api` | Python 3.11.11 · Django (unpinned in [Pipfile](../learn-ops-api/Pipfile), likely 4.x) · Django REST Framework | Serves the REST API consumed by the client; handles GitHub OAuth login, enforces role-based access, and exposes all learning platform data |
+| `client` | React 16.13.x · Node 22.13.0 · React Router 5.x | Delivers the browser UI that students and instructors interact with to view dashboards, manage coursework, and track progress |
+| `prometheus` | Prometheus (latest — unpinned in [docker-compose.yml](./docker-compose.yml)) | Scrapes time-series metrics from the Django API and the Postgres exporter on a 15-second interval and stores them for querying |
+| `grafana` | Grafana (latest — unpinned in [docker-compose.yml](./docker-compose.yml)) | Visualises Prometheus metrics through dashboards, giving operators a live view of API performance and database health |
+| `postgres_exporter` | Prometheus Community Postgres Exporter (latest — unpinned in [docker-compose.yml](./docker-compose.yml)) | Connects to the Postgres database and translates internal database statistics into Prometheus-scrapeable metrics |
 
 ## 3. System Overview
+
+Learn Ops is an internal learning management system (LMS) built for a software development bootcamp. It solves the operational problem of managing a cohort-based curriculum at scale: before a tool like this, instructors would need to track student progress, assignment completion, and assessment results across spreadsheets or disconnected tools. Learn Ops centralises all of that into a single web application backed by a REST API and a relational database.
+
+From a user's perspective, the system lets students view their current coursework, set and track daily goals, check their assessment status, submit project proposals, and post Slack standup updates — all from one place. Instructors can create and organise courses, books, and projects; manage cohort enrollment; run assessments; and leave feedback on student work. The platform also integrates with GitHub for authentication and project tracking, and with Slack for communication, so it fits into the workflow students and instructors are already using.
+
+The system has three distinct user roles, each with a different view of the application. **Students** see their own progress, tasks, and upcoming assessments. **Instructors** see the full cohort picture — who is on track, who needs support, and how the curriculum is structured. **Staff** have a separate, narrower view focused on foundations exercises. A superuser role exists for system administration via Django's built-in admin interface. This role-based split is enforced at the routing level: after login, the app directs each user to the view that matches their role.
